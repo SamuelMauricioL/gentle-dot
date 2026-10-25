@@ -16,6 +16,7 @@ use crate::computer::SystemClock;
 use crate::config::DesktopConfig;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, EventTarget, Manager};
 
@@ -133,6 +134,9 @@ struct WakeInner {
     config_file: PathBuf,
     /// `<data dir>/wake-word/oye-dot.rpw` (S4).
     model: PathBuf,
+    /// Where the local model is installed, when it is: the model manager's own answer, over the
+    /// models root `model.rs` uses, so the spike never guesses a path.
+    parakeet: Locate,
     /// `<data dir>/wake-word.log` (S5).
     log: PathBuf,
     events: Events,
@@ -140,12 +144,13 @@ struct WakeInner {
 }
 
 impl Wake {
-    pub fn new(voice: Option<Voice>, config: &DesktopConfig, events: Events) -> Self {
+    pub fn new(voice: Option<Voice>, config: &DesktopConfig, events: Events, parakeet: Locate) -> Self {
         Wake {
             inner: Arc::new(WakeInner {
                 voice,
                 config_file: config.data_dir.join("config.json"),
                 model: wake::model_path(&config.data_dir),
+                parakeet,
                 log: config.data_dir.join("wake-word.log"),
                 events,
                 enabled: Mutex::new(false),
@@ -184,10 +189,20 @@ impl Wake {
         if self.inner.voice.is_none() || self.detector.is_none() {
             return Some(UNSUPPORTED.to_string());
         }
+        // The spike listens with the local model, which it does not need a reference file for.
+        if self.local().is_some() {
+            return None;
+        }
         if !self.inner.model.is_file() {
             return Some(wake::missing(&self.inner.model));
         }
         None
+    }
+
+    /// The installed local model's directory, when it is installed (`model.rs` checks every file
+    /// it needs).
+    fn local(&self) -> Option<PathBuf> {
+        (self.inner.parakeet)()
     }
 
     /// Turns the detector on or off, applying it now and saving the flag in `config.json` (S1).
@@ -202,7 +217,11 @@ impl Wake {
         } else {
             self.disarm();
         }
-        crate::config::save_wake_word(&self.inner.config_file, enabled)?;
+        if let Err(error) = crate::config::save_wake_word(&self.inner.config_file, enabled) {
+            // The arm already happened, so the microphone is open: say why the flag did not stick.
+            self.log("failed", serde_json::json!({ "step": "save", "enabled": enabled, "reason": error }));
+            return Err(error);
+        }
         self.set_enabled(enabled);
         Ok(self.status())
     }
@@ -225,9 +244,32 @@ impl Wake {
     /// Waits for the phrase on the microphone the app already has (S2): a fresh detector, so the
     /// audio of the last note cannot match the next one.
     fn listen(&self, voice: &Voice) -> Result<(), VoiceError> {
-        let load = self.detector.as_ref().ok_or(VoiceError::Unsupported)?;
-        let detector = load(&self.inner.model).map_err(VoiceError::Failed)?;
-        voice.arm(detector, self.listen_events())
+        // Spike: the local model listening for the phrase when it is installed, the trained
+        // reference otherwise. Loading either one takes seconds, so this runs off the audio thread.
+        let detector = match self.local() {
+            Some(dir) => Arc::new(
+                wake::ParakeetWake::load(&dir, self.inner.log.clone()).map_err(VoiceError::Failed)?,
+            ) as Arc<dyn WakeWord>,
+            None => {
+                let load = self.detector.as_ref().ok_or(VoiceError::Unsupported)?;
+                load(&self.inner.model).map_err(VoiceError::Failed)?
+            }
+        };
+        // Diagnostic wrapper (temporary): the first frame the detector receives goes into the wake
+        // log, so a run with no match can tell "no audio arrived" apart from "audio that never
+        // scored". `eprintln!` cannot: a bundle launched from the Finder has no visible stderr.
+        let detector: Arc<dyn WakeWord> = Arc::new(HeardOnce {
+            inner: detector,
+            log: self.inner.log.clone(),
+            chunks: AtomicUsize::new(0),
+            loud: AtomicUsize::new(0),
+            peak: Mutex::new(0.0),
+        });
+        let armed = voice.arm(detector, self.listen_events());
+        if let Err(error) = &armed {
+            self.log("failed", serde_json::json!({ "step": "arm", "reason": error.to_string() }));
+        }
+        armed
     }
 
     fn disarm(&self) {
@@ -321,6 +363,56 @@ impl Wake {
     }
 }
 
+/// Temporary diagnostic (see `Wake::listen`): writes the level of the audio the detector receives to
+/// the wake log, so a run with no match can tell "silent audio" apart from "audio that never scored".
+struct HeardOnce {
+    inner: Arc<dyn WakeWord>,
+    log: PathBuf,
+    chunks: AtomicUsize,
+    loud: AtomicUsize,
+    peak: Mutex<f32>,
+}
+
+impl WakeWord for HeardOnce {
+    fn accept(&self, samples: &[f32]) -> Option<wake::Detection> {
+        let count = self.chunks.fetch_add(1, Ordering::SeqCst);
+        let sum: f32 = samples.iter().map(|sample| sample * sample).sum();
+        let rms = (sum / samples.len().max(1) as f32).sqrt();
+        let peak = {
+            let mut peak = self.peak.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if rms > *peak {
+                *peak = rms;
+            }
+            *peak
+        };
+        let speakable = rms > 0.015;
+        // A chunk loud enough to be speech is always written (the first ten), so a run can tell
+        // whether the voice reaches the detector at all; the periodic line carries the peak.
+        let first_loud = speakable && self.loud.fetch_add(1, Ordering::SeqCst) < 10;
+        if count < 5 || count % 50 == 0 || first_loud {
+            let line = serde_json::json!({
+                "at": now_ms(),
+                "event": if speakable { "loud" } else { "heard" },
+                "chunk": count,
+                "samples": samples.len(),
+                "rms": rms,
+                "peak": peak
+            })
+            .to_string()
+                + "\n";
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&self.log) {
+                use std::io::Write;
+                let _ = file.write_all(line.as_bytes());
+            }
+        }
+        self.inner.accept(samples)
+    }
+
+    fn reset(&self) {
+        self.inner.reset();
+    }
+}
+
 /// Milliseconds since the epoch, for the log's timestamp.
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -392,7 +484,7 @@ pub fn start(app: &AppHandle) -> (VoiceInput, VoiceModel) {
     let installed = manager.clone();
     let locate: Locate = Arc::new(move || installed.installed());
     let loader: Loader = Arc::new(parakeet::load);
-    let local = Arc::new(Parakeet::new(locate, loader));
+    let local = Arc::new(Parakeet::new(locate.clone(), loader));
     let mut input = platform_input(local.clone());
     let config = crate::config::load_config();
     let panel = app.clone();
@@ -402,7 +494,7 @@ pub fn start(app: &AppHandle) -> (VoiceInput, VoiceModel) {
             eprintln!("gentle-dot: cannot send a voice event: {error}");
         }
     });
-    let wake = Wake::new(input.voice.clone(), &config, panel_events);
+    let wake = Wake::new(input.voice.clone(), &config, panel_events, locate);
     // S1: the flag is read here and applied now; a failure is logged with its reason.
     wake.startup(config.wake_word);
     input.wake = Some(wake);
@@ -633,7 +725,7 @@ mod tests {
             let detector = detector.clone();
             Arc::new(move |_| Ok(detector.clone() as Arc<dyn WakeWord>))
         };
-        let wake = Wake::new(Some(voice), &config(dir.clone()), recorder.events()).with_detector(load);
+        let wake = Wake::new(Some(voice), &config(dir.clone()), recorder.events(), Arc::new(|| None)).with_detector(load);
         WakeRig { wake, mic, recognizer, detector, recorder, dir }
     }
 
@@ -672,6 +764,21 @@ mod tests {
     }
 
     #[test]
+    fn an_installed_local_model_listens_without_the_reference_file() {
+        // The spike: with the local model installed, the trained reference is not what it needs.
+        let dir = scratch("parakeet");
+        let voice = Voice::new(
+            Arc::new(FakeMicrophone::granted()),
+            Arc::new(FakeRecognizer::granted()),
+            Arc::new(FakeClock(AtomicU64::new(0))),
+        );
+        let locate: Locate = Arc::new(|| Some(PathBuf::from("/models/parakeet-tdt-0.6b-v3-int8")));
+        let detector: Load = Arc::new(|_| Ok(Arc::new(FakeWake::default()) as Arc<dyn WakeWord>));
+        let wake = Wake::new(Some(voice), &config(dir), Recorder::default().events(), locate).with_detector(detector);
+        assert_eq!(wake.status(), WakeStatus { enabled: false, available: true, reason: None });
+    }
+
+    #[test]
     fn a_saved_flag_is_applied_at_startup() {
         let rig = wake_rig("startup", true);
         rig.wake.startup(true);
@@ -690,8 +797,13 @@ mod tests {
         rig.mic.sink().audio(&[0.2; 480]);
         wait_until("the note starts", || rig.mic.log.lock().unwrap().opened == 2);
         let log = std::fs::read_to_string(rig.dir.join("wake-word.log")).unwrap();
-        let line: serde_json::Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
-        assert_eq!(line["event"], serde_json::json!("detected"));
+        // The diagnostic probe logs `heard` for the first frame the detector receives, so the match
+        // is found by name rather than by being the first line.
+        let line = log
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|line| line["event"] == serde_json::json!("detected"))
+            .expect("the match is logged");
         assert!((line["score"].as_f64().unwrap() - 0.51).abs() < 1e-5, "{line}");
         assert_eq!(line["model"], serde_json::json!(wake::WAKE_WORD));
         assert!(line["at"].as_u64().is_some(), "the line is timestamped: {line}");
