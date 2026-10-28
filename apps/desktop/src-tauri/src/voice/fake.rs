@@ -1,10 +1,12 @@
 //! Fakes for the voice tests: a microphone and a recognizer that record what the machine asks
 //! of them and let a test play the platform's side (audio, results, failures).
 
-use super::{Authorization, Events, Microphone, NativeAudio, Recognition, Recognizer, Sink, Stream, VoiceError, VoiceEvent};
+use super::{AudioSink, Authorization, Events, Microphone, NativeAudio, Recognition, Recognizer, Sink, SinkSlot, Stream, VoiceError, VoiceEvent};
+use super::{ListenEvent, ListenEvents};
 use crate::computer::Clock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::ThreadId;
 
 /// Blocks a permission prompt until the test answers it.
 #[derive(Default)]
@@ -32,7 +34,30 @@ pub struct MicLog {
     pub requests: usize,
     pub opened: usize,
     pub closed: usize,
-    pub sink: Option<Sink>,
+    /// Every open and close in order, so a test can read the capture cycle instead of guessing.
+    pub history: Vec<&'static str>,
+    /// How many times a capture opened while another was still open (S5: it must never happen).
+    pub overlap: usize,
+    /// The sink the capture is attached to right now, and every change to it: with one engine the
+    /// swaps replace the captures a test used to count (T9).
+    pub sink: Option<AudioSink>,
+    pub selected: Vec<&'static str>,
+    /// The device each capture was asked for; `None` is the system default input.
+    pub devices: Vec<Option<String>>,
+    /// Buffers the engine delivered, whoever the sink was: a fresh counter per capture.
+    pub frames: Arc<AtomicU64>,
+}
+
+impl MicLog {
+    /// A note owns the audio right now.
+    pub fn recording(&self) -> bool {
+        matches!(self.sink, Some(AudioSink::Recording(_)))
+    }
+
+    /// The detector owns the audio right now.
+    pub fn listening(&self) -> bool {
+        matches!(self.sink, Some(AudioSink::Listener(_)))
+    }
 }
 
 pub struct FakeMicrophone {
@@ -62,9 +87,26 @@ impl FakeMicrophone {
         mic
     }
 
-    /// The sink of the latest capture, to play the audio thread.
-    pub fn sink(&self) -> Sink {
-        self.log.lock().unwrap().sink.clone().expect("the microphone was opened")
+    /// The sink of the latest capture, to play the audio thread. Each call is one buffer the engine
+    /// delivered, which is what keeps the capture alive in the machine's eyes (T9).
+    pub fn sink(&self) -> AudioSink {
+        let log = self.log.lock().unwrap();
+        log.frames.fetch_add(1, Ordering::SeqCst);
+        log.sink.clone().expect("the capture is attached to a sink")
+    }
+}
+
+impl FakeMicrophone {
+    /// Makes the next captures fail, or lets them work again.
+    pub fn set_open_error(&self, error: Option<VoiceError>) {
+        *self.open_error.lock().unwrap() = error;
+    }
+
+    /// The engine stopped delivering: the counter the open capture reports no longer moves, however
+    /// much audio a test still plays through its sink (a device that went away, a Bluetooth input
+    /// that slept). The next capture opened here counts from zero again.
+    pub fn stop_delivering(&self) {
+        self.log.lock().unwrap().frames = Arc::new(AtomicU64::new(0));
     }
 }
 
@@ -83,24 +125,58 @@ impl Microphone for FakeMicrophone {
         answer
     }
 
-    fn open(&self, sink: Sink) -> Result<Box<dyn Stream>, VoiceError> {
+    fn open(&self, device: Option<&str>, slot: SinkSlot) -> Result<Box<dyn Stream>, VoiceError> {
         if let Some(error) = self.open_error.lock().unwrap().clone() {
+            // A refused capture still records which device was asked for: the fallback chain is
+            // only observable through it.
+            self.log.lock().unwrap().devices.push(device.map(str::to_string));
             return Err(error);
         }
         let mut log = self.log.lock().unwrap();
         log.opened += 1;
-        log.sink = Some(sink);
-        Ok(Box::new(FakeStream { log: self.log.clone() }))
+        // Two captures open at once is the bug this app must never have (S5).
+        if log.opened > log.closed + 1 {
+            log.overlap += 1;
+        }
+        log.history.push("open");
+        log.devices.push(device.map(str::to_string));
+        // A fresh engine counts from zero, as a real device's tap would.
+        let frames = Arc::new(AtomicU64::new(0));
+        log.frames = frames.clone();
+        log.sink = None;
+        Ok(Box::new(FakeStream { log: self.log.clone(), slot, frames }))
     }
 }
 
 struct FakeStream {
     log: Arc<Mutex<MicLog>>,
+    slot: SinkSlot,
+    frames: Arc<AtomicU64>,
 }
 
 impl Stream for FakeStream {
     fn close(&mut self) {
-        self.log.lock().unwrap().closed += 1;
+        let mut log = self.log.lock().unwrap();
+        log.closed += 1;
+        log.history.push("close");
+    }
+
+    fn select(&mut self, sink: Option<AudioSink>) {
+        let name = match &sink {
+            Some(AudioSink::Recording(_)) => "recording",
+            Some(AudioSink::Listener(_)) => "listener",
+            None => "none",
+        };
+        if let Ok(mut slot) = self.slot.write() {
+            *slot = sink.clone();
+        }
+        let mut log = self.log.lock().unwrap();
+        log.selected.push(name);
+        log.sink = sink;
+    }
+
+    fn frames(&self) -> u64 {
+        self.frames.load(Ordering::SeqCst)
     }
 }
 
@@ -124,6 +200,8 @@ pub struct FakeRecognizer {
     /// Delivered through the sink when the recognition is finished; none plays a recognizer
     /// that never answers.
     pub final_text: Mutex<Option<String>>,
+    /// One text per note, handed out in order, for a test that runs several notes.
+    pub queued_texts: Mutex<Vec<String>>,
     /// Reported as a failure when the recognition is finished.
     pub fail_on_finish: Mutex<Option<String>>,
     /// Plays a recognizer that takes the device's own audio (as Apple Speech does).
@@ -139,6 +217,7 @@ impl FakeRecognizer {
             current: "en_US".into(),
             supported: vec!["en-US".into(), "es-ES".into(), "es-MX".into()],
             final_text: Mutex::new(None),
+            queued_texts: Mutex::new(Vec::new()),
             fail_on_finish: Mutex::new(None),
             native: false,
             log: Arc::default(),
@@ -154,6 +233,13 @@ impl FakeRecognizer {
 
     pub fn sink(&self) -> Sink {
         self.log.lock().unwrap().sink.clone().expect("a recognition began")
+    }
+
+    /// The transcript each of the next notes gets, in order (S7).
+    pub fn saying_each(&self, texts: &[&str]) {
+        let mut queued = self.queued_texts.lock().unwrap();
+        queued.clear();
+        queued.extend(texts.iter().map(|text| (*text).to_string()));
     }
 }
 
@@ -181,7 +267,14 @@ impl Recognizer for FakeRecognizer {
         let mut log = self.log.lock().unwrap();
         log.locales.push(locale.into());
         log.sink = Some(sink.clone());
-        let final_text = self.final_text.lock().unwrap().clone();
+        let final_text = self.final_text.lock().unwrap().clone().or_else(|| {
+            let mut queued = self.queued_texts.lock().unwrap();
+            if queued.is_empty() {
+                None
+            } else {
+                Some(queued.remove(0))
+            }
+        });
         let failure = self.fail_on_finish.lock().unwrap().clone();
         Ok(Box::new(FakeRecognition { log: self.log.clone(), sink, final_text, failure, native: self.native }))
     }
@@ -247,6 +340,44 @@ impl Recorder {
 
     pub fn levels(&self) -> usize {
         self.seen().iter().filter(|event| matches!(event, VoiceEvent::Level(_))).count()
+    }
+}
+
+/// Collects what an armed wake word reported, and on which thread, so a test can check that no
+/// handler ever runs on the audio thread.
+#[derive(Default, Clone)]
+pub struct Listenings(Arc<Mutex<Vec<(ListenEvent, ThreadId)>>>);
+
+impl Listenings {
+    pub fn events(&self) -> ListenEvents {
+        let seen = self.0.clone();
+        Arc::new(move |event| seen.lock().unwrap().push((event, std::thread::current().id())))
+    }
+
+    pub fn seen(&self) -> Vec<ListenEvent> {
+        self.0.lock().unwrap().iter().map(|(event, _)| event.clone()).collect()
+    }
+
+    pub fn threads(&self) -> Vec<ThreadId> {
+        self.0.lock().unwrap().iter().map(|(_, thread)| *thread).collect()
+    }
+
+    /// Waits for `count` reports (they come from spawned threads), then checks there are exactly
+    /// that many.
+    pub fn wait_for(&self, count: usize) -> Vec<ListenEvent> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.0.lock().unwrap().len() < count && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let seen = self.seen();
+        assert_eq!(seen.len(), count, "reports: {seen:?}");
+        seen
+    }
+
+    /// Gives a spawned report time to arrive, so a test can assert there was none.
+    pub fn settle(&self) -> Vec<ListenEvent> {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        self.seen()
     }
 }
 

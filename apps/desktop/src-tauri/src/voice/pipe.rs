@@ -3,10 +3,10 @@
 //! pipewire-pulse) is tried first, then `arecord` (ALSA). Linux has no microphone permission to
 //! ask for. Compiled on every Unix so the tests run on macOS too; only Linux uses it.
 
-use super::{Authorization, Microphone, Sink, Stream, VoiceError};
+use super::{AudioSink, Authorization, Microphone, SinkSlot, Stream, VoiceError};
 use std::io::{self, Read};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Bytes per read: 512 samples, 32 ms.
@@ -59,7 +59,8 @@ impl Microphone for PipeMicrophone {
         Authorization::Authorized
     }
 
-    fn open(&self, sink: Sink) -> Result<Box<dyn Stream>, VoiceError> {
+    // Linux keeps the system default input: a recorder command has no device to be pointed at (S7).
+    fn open(&self, _device: Option<&str>, slot: SinkSlot) -> Result<Box<dyn Stream>, VoiceError> {
         for recorder in &self.recorders {
             let Some((program, args)) = recorder.split_first() else { continue };
             let spawned = Command::new(program).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn();
@@ -71,6 +72,11 @@ impl Microphone for PipeMicrophone {
             let Some(mut output) = child.stdout.take() else { continue };
             let closed = Arc::new(AtomicBool::new(false));
             let reading = closed.clone();
+            // The recorder is the engine here: the bytes it writes are its liveness, whether or not
+            // a sink is attached at that moment (T9).
+            let frames = Arc::new(AtomicU64::new(0));
+            let counting = frames.clone();
+            let reading_slot = slot.clone();
             let read = move || {
                 let mut decoder = Decoder::default();
                 let mut buffer = [0u8; READ_BYTES];
@@ -80,7 +86,13 @@ impl Microphone for PipeMicrophone {
                         Ok(read) => {
                             let samples = decoder.push(&buffer[..read]);
                             if !samples.is_empty() {
-                                sink.audio(&samples);
+                                counting.fetch_add(1, Ordering::Relaxed);
+                                // Who owns the capture right now, cloned and released before the
+                                // sink's own work: the swap happens on another thread.
+                                let sink = reading_slot.read().ok().and_then(|slot| slot.clone());
+                                if let Some(sink) = sink {
+                                    sink.audio(&samples);
+                                }
                             }
                         }
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -89,7 +101,10 @@ impl Microphone for PipeMicrophone {
                 }
                 // The recorder ended without being closed: the device went away or failed.
                 if !reading.load(Ordering::SeqCst) {
-                    sink.failed(&VoiceError::Interrupted.to_string());
+                    let sink = reading_slot.read().ok().and_then(|slot| slot.clone());
+                    if let Some(sink) = sink {
+                        sink.failed(&VoiceError::Interrupted.to_string());
+                    }
                 }
             };
             if let Err(error) = std::thread::Builder::new().name("voice-recorder".into()).spawn(read) {
@@ -97,7 +112,7 @@ impl Microphone for PipeMicrophone {
                 let _ = child.wait();
                 return Err(VoiceError::Failed(format!("The microphone could not start: {error}")));
             }
-            return Ok(Box::new(PipeStream { child, closed }));
+            return Ok(Box::new(PipeStream { child, closed, slot, frames }));
         }
         Err(VoiceError::NoRecorder)
     }
@@ -106,6 +121,8 @@ impl Microphone for PipeMicrophone {
 struct PipeStream {
     child: Child,
     closed: Arc<AtomicBool>,
+    slot: SinkSlot,
+    frames: Arc<AtomicU64>,
 }
 
 impl Stream for PipeStream {
@@ -114,6 +131,16 @@ impl Stream for PipeStream {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+    }
+
+    fn select(&mut self, sink: Option<AudioSink>) {
+        if let Ok(mut slot) = self.slot.write() {
+            *slot = sink;
+        }
+    }
+
+    fn frames(&self) -> u64 {
+        self.frames.load(Ordering::Relaxed)
     }
 }
 
@@ -177,7 +204,7 @@ mod tests {
             command(&["/bin/sh", "-c", "head -c 6400 /dev/zero; exec sleep 30"]),
         ]);
         let (voice, recognizer) = voice(mic);
-        voice.start(None, Recorder::default().events()).unwrap();
+        voice.start(None, None, Recorder::default().events()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while recognizer.log.lock().unwrap().fed.len() < 1_600 {
             assert!(Instant::now() < deadline, "the PCM arrives");
@@ -195,7 +222,7 @@ mod tests {
         let mic = PipeMicrophone::with(vec![command(&["/bin/sh", "-c", "head -c 64 /dev/zero; sleep 0.3"])]);
         let (voice, _) = voice(mic);
         let recorder = Recorder::default();
-        voice.start(None, recorder.events()).unwrap();
+        voice.start(None, None, recorder.events()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let interrupted = crate::voice::VoiceEvent::Error(VoiceError::Interrupted.to_string());
         while !recorder.seen().contains(&interrupted) {
@@ -209,7 +236,7 @@ mod tests {
     fn no_recorder_on_the_system_explains_what_to_install() {
         let mic = PipeMicrophone::with(vec![command(&["gentle-dot-no-such-recorder"])]);
         let (voice, _) = voice(mic);
-        assert_eq!(voice.start(None, Recorder::default().events()), Err(VoiceError::NoRecorder));
+        assert_eq!(voice.start(None, None, Recorder::default().events()), Err(VoiceError::NoRecorder));
         assert!(VoiceError::NoRecorder.to_string().contains("pulseaudio-utils"));
     }
 }

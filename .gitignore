@@ -23,3 +23,6 @@ packages/*/src/**/*.d.ts
 /packages/daemon/native/*.lib
 /packages/daemon/native/*.exp
 /packages/daemon/native/*.pdb
+
+# The wake word's reference (S4): a voice signature, never committed
+*.rpw

@@ -4,7 +4,10 @@
 		{
 			"identifier": "default",
 			"description": "What the Dot and panel UI may call: event listening, Dot dragging, opening web pages (sign-in), the shell commands (hiding the rose and the full-screen panel included), and the computer-control commands (yolo mode included: its native confirmation decides).",
-			"windows": ["dot", "panel"],
+			"windows": [
+				"dot",
+				"panel"
+			],
 			"permissions": [
 				"core:event:allow-listen",
 				"core:event:allow-unlisten",
@@ -27,36 +30,58 @@
 		},
 		{
 			"identifier": "voice",
-			"description": "Voice input (S30.1, S30.5): the panel's mic button records and transcribes natively, and the panel downloads, cancels, and removes the optional local voice model; the Dot never records.",
-			"windows": ["panel"],
+			"description": "Voice input (S30.1, S30.5, S30.7): the panel's mic button records and transcribes natively, the panel reads and changes the microphone it records from, the panel downloads, cancels, and removes the optional local voice model, and the panel reads and turns on the wake word that listens on the same microphone; the Dot never records and never listens.",
+			"windows": [
+				"panel"
+			],
 			"permissions": [
 				"allow-voice-status",
 				"allow-voice-start",
 				"allow-voice-stop",
 				"allow-voice-cancel",
+				"allow-voice-input-options",
+				"allow-voice-input-set",
 				"allow-voice-model-status",
 				"allow-voice-model-download",
 				"allow-voice-model-cancel",
-				"allow-voice-model-remove"
+				"allow-voice-model-remove",
+				"allow-wake-word-status",
+				"allow-wake-word-set",
+				"allow-wake-phrase-set"
 			]
 		},
 		{
 			"identifier": "settings",
 			"description": "The panel's Settings screen (S33): read and change the shortcut that opens the panel; the Dot never changes it.",
-			"windows": ["panel"],
-			"permissions": ["allow-shortcut-get", "allow-shortcut-set"]
+			"windows": [
+				"panel"
+			],
+			"permissions": [
+				"allow-shortcut-get",
+				"allow-shortcut-set"
+			]
 		},
 		{
 			"identifier": "connectors",
 			"description": "Connector changes from the panel (S25.2): sent to the daemon over the app's private channel on behalf of the panel's window; the Dot and the web page cannot make them.",
-			"windows": ["panel"],
-			"permissions": ["allow-connector-command"]
+			"windows": [
+				"panel"
+			],
+			"permissions": [
+				"allow-connector-command"
+			]
 		},
 		{
 			"identifier": "glow",
 			"description": "What the computer-control glow overlay (S28) may call: listening to the glow, working, and session events, and acknowledging that the working rings are on screen; nothing else.",
-			"windows": ["glow"],
-			"permissions": ["core:event:allow-listen", "core:event:allow-unlisten", "allow-computer-working-ready"]
+			"windows": [
+				"glow"
+			],
+			"permissions": [
+				"core:event:allow-listen",
+				"core:event:allow-unlisten",
+				"allow-computer-working-ready"
+			]
 		}
 	]
 }

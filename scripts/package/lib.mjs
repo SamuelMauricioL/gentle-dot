@@ -203,9 +203,43 @@ export function parseMacArgs(argv, env = process.env) {
 		options[name] = value;
 		i++;
 	}
-	const identity = options.sign ?? (env.GENTLE_DOT_SIGN_IDENTITY || AD_HOC);
+	// `--sign` wins, then the environment. With neither, the identity is left for
+	// `resolveMacIdentity`, which asks the keychain instead of silently signing ad hoc: an ad hoc
+	// signature has a new designated requirement on every build, so macOS forgets the permissions
+	// the user granted (S29.2).
+	const explicit = options.sign;
 	delete options.sign;
-	return { ...options, identity };
+	const fromEnv = env.GENTLE_DOT_SIGN_IDENTITY || undefined;
+	return { ...options, requestedIdentity: explicit ?? fromEnv, identity: explicit ?? fromEnv ?? AD_HOC };
+}
+
+/** The name `create-signing-identity.sh` gives the self-signed certificate it creates. */
+export const LOCAL_IDENTITY = "Gentle Dot Local Signing";
+
+/** The identities a Mac can sign with: `Apple Development` first, the local self-signed next. */
+export function pickSigningIdentity(available) {
+	const apple = available.find((name) => name.startsWith("Apple Development:"));
+	if (apple) return { identity: apple, reason: "a development certificate already in the keychain" };
+	if (available.includes(LOCAL_IDENTITY)) return { identity: LOCAL_IDENTITY, reason: "the local signing certificate" };
+	if (available[0]) return { identity: available[0], reason: "the only code signing certificate in the keychain" };
+	return { identity: AD_HOC, reason: "" };
+}
+
+/**
+ * Decides the identity a build is signed with: the one asked for, else the keychain's best. When
+ * it has to fall back to ad hoc it says why that costs the user permissions.
+ */
+export function resolveMacIdentity(requested, available) {
+	if (requested) return { identity: requested, notice: undefined, reason: "asked for" };
+	const picked = pickSigningIdentity(available);
+	if (picked.identity === AD_HOC)
+		return {
+			identity: AD_HOC,
+			reason: "no code signing certificate in the keychain",
+			notice:
+				"Signing ad hoc: every build gets a new designated requirement, so macOS asks for the microphone and Screen Recording again. Run scripts/package/create-signing-identity.sh once, or pass --sign <identity>.",
+		};
+	return { identity: picked.identity, notice: undefined, reason: picked.reason };
 }
 
 /**

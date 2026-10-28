@@ -33,6 +33,7 @@ import {
 	keepsOwnSignature,
 	modeDifferences,
 	parseMacArgs,
+	resolveMacIdentity,
 	sha256File,
 	tauriReleaseConfig,
 } from "./lib.mjs";
@@ -51,6 +52,14 @@ function run(command, args, options = {}) {
 			`${command} ${args.join(" ")} failed (${result.error?.message ?? `exit ${result.status}`}).`,
 		);
 	return result;
+}
+
+
+/** The code signing identities the keychain offers, by common name; empty when none does. */
+function signingIdentities() {
+	const listed = spawnSync("security", ["find-identity", "-v", "-p", "codesigning"], { encoding: "utf8" });
+	if (listed.status !== 0) return [];
+	return [...listed.stdout.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
 }
 
 /** Runs a command, prints what it wrote (codesign reports on stderr), and fails on a non-zero exit. */
@@ -177,6 +186,12 @@ function checkDmg(dmg) {
 
 async function main() {
 	const options = parseMacArgs(process.argv.slice(2));
+	// A stable identity is what keeps one designated requirement across builds, and with it the
+	// permissions the user granted (S29.2). Ad hoc is the last resort, never the default.
+	const resolved = resolveMacIdentity(options.requestedIdentity, signingIdentities());
+	options.identity = resolved.identity;
+	if (resolved.notice) say(`WARNING: ${resolved.notice}`);
+	else say(`Signing with ${identityName(resolved.identity)} (${resolved.reason})`);
 	assertHostTarget(TARGET);
 	if (options.checkDmg) {
 		checkDmg(resolve(process.env.INIT_CWD ?? process.cwd(), options.checkDmg));

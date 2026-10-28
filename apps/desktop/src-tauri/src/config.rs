@@ -12,6 +12,23 @@ pub struct DesktopConfig {
     pub data_dir: PathBuf,
     pub port: u16,
     pub shortcut: String,
+    /// The microphone to record from; `None` follows the system default.
+    pub voice_input: Option<VoiceInput>,
+    /// Whether the wake word listens (S1, S30.7). Off until the user turns it on in Settings, and
+    /// only then does the detector ever run.
+    pub wake_word: bool,
+    /// The words the detector listens for, editable in Settings so a phrase can be tried before
+    /// it is worth training anything (S30.7).
+    pub wake_phrase: String,
+}
+
+/// The microphone chosen in Settings (S4): the CoreAudio UID is the identity, the name is for
+/// display only.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceInput {
+    pub uid: String,
+    pub name: String,
 }
 
 /// Result of the `connection_info` command (design §9).
@@ -59,8 +76,17 @@ pub fn parse_config(
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_SHORTCUT)
         .to_string();
-    DesktopConfig { data_dir, port, shortcut }
-}
+    // A malformed, empty or partial entry is no choice at all: following the default beats
+    // recording from half a device.
+    let voice_input = file.get("voiceInput").and_then(|value| {
+        let uid = value.get("uid")?.as_str()?.trim();
+        let name = value.get("name")?.as_str()?.trim();
+        (!uid.is_empty() && !name.is_empty()).then(|| VoiceInput { uid: uid.to_string(), name: name.to_string() })
+    });
+    let wake_word = file["wake_word"].as_bool().unwrap_or(false);
+    // An empty or missing phrase is the default: listening for nothing would be worse.
+    let wake_phrase = file["wake_phrase"].as_str().map(str::trim).filter(|text| !text.is_empty()).unwrap_or(DEFAULT_WAKE_PHRASE).to_string();
+    DesktopConfig { data_dir, port, shortcut, voice_input, wake_word, wake_phrase }}
 
 /// HOME keeps precedence on every platform; USERPROFILE is a Windows-only fallback.
 /// Pure so profile selection can be checked without reading a real user's environment.
@@ -82,12 +108,28 @@ pub fn load_config() -> DesktopConfig {
     parse_config(dir, file.as_deref(), env)
 }
 
+/// The phrase the detector listens for until the user types another one.
+pub const DEFAULT_WAKE_PHRASE: &str = "oye Doti";
+
+/// What the panel may type as a phrase: one to four words of letters and digits, each at least
+/// two characters. Long phrases are a paragraph, and one-letter words are noise.
+pub fn valid_wake_phrase(text: &str) -> Result<String, String> {
+    let trimmed = text.trim();
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    let shaped = (1..=4).contains(&words.len())
+        && words.iter().all(|word| word.chars().count() >= 2 && word.chars().all(|c| c.is_alphanumeric()));
+    if !shaped {
+        return Err("Type one to four words, letters and numbers only, two characters or more each.".to_string());
+    }
+    Ok(trimmed.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
 pub const INVALID_CONFIG: &str =
     "config.json is not valid JSON, so Gentle Dot left it as it is. Fix or remove it, then try again.";
 
-/// The text of `config.json` with `shortcut` set and every other key kept.
+/// The text of `config.json` with one key set and every other key kept.
 /// A file that is not a JSON object is refused rather than replaced.
-pub fn with_shortcut(file: Option<&str>, shortcut: &str) -> Result<String, String> {
+fn with_entry(file: Option<&str>, key: &str, value: serde_json::Value) -> Result<String, String> {
     let mut json = match file {
         Some(text) => serde_json::from_str::<serde_json::Value>(text)
             .ok()
@@ -95,23 +137,107 @@ pub fn with_shortcut(file: Option<&str>, shortcut: &str) -> Result<String, Strin
             .ok_or(INVALID_CONFIG)?,
         None => serde_json::json!({}),
     };
-    json["shortcut"] = shortcut.into();
+    json[key] = value;
     let text = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
     Ok(text + "\n")
 }
 
-/// Saves the shortcut in `config.json` (S33.3): read, change one key, then write a private
-/// temporary file and rename it over the old one, so a crash never leaves half a file.
-pub fn save_shortcut(path: &Path, shortcut: &str) -> Result<(), String> {
+/// The text of `config.json` with `shortcut` set and every other key kept.
+pub fn with_shortcut(file: Option<&str>, shortcut: &str) -> Result<String, String> {
+    with_entry(file, "shortcut", shortcut.into())
+}
+
+/// The text of `config.json` with `voiceInput` set and every other key kept; `None` follows the
+/// system default.
+pub fn with_voice_input(file: Option<&str>, input: Option<&VoiceInput>) -> Result<String, String> {
+    let value = match input {
+        Some(input) => serde_json::json!({ "uid": input.uid, "name": input.name }),
+        None => serde_json::Value::Null,
+    };
+    with_entry(file, "voiceInput", value)
+}
+
+/// Reads `config.json`, changes one key, then writes a private temporary file and renames it over
+/// the old one (S33.3), so a crash never leaves half a file.
+fn save_with(path: &Path, change: impl FnOnce(Option<&str>) -> Result<String, String>) -> Result<(), String> {
     let file = match std::fs::read_to_string(path) {
         Ok(text) => Some(text),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(format!("Gentle Dot cannot read config.json ({error}), so the shortcut was not saved.")),
     };
-    let text = with_shortcut(file.as_deref(), shortcut)?;
+    let text = change(file.as_deref())?;
     write_private(path, &text).map_err(|error| format!("Gentle Dot cannot save config.json ({error})."))
 }
 
+/// Saves the panel shortcut in `config.json`.
+pub fn save_shortcut(path: &Path, shortcut: &str) -> Result<(), String> {
+    save_with(path, |file| with_shortcut(file, shortcut))
+}
+
+/// Saves the chosen microphone in `config.json`; `None` follows the system default.
+pub fn save_voice_input(path: &Path, input: Option<&VoiceInput>) -> Result<(), String> {
+    save_with(path, |file| with_voice_input(file, input))
+}
+/// The text of `config.json` with `wake_word` set and every other key kept (S1).
+pub fn with_wake_word(file: Option<&str>, wake_word: bool) -> Result<String, String> {
+    let mut json = match file {
+        Some(text) => serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .filter(serde_json::Value::is_object)
+            .ok_or(INVALID_CONFIG)?,
+        None => serde_json::json!({}),
+    };
+    json["wake_word"] = wake_word.into();
+    let text = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
+    Ok(text + "\n")
+}
+
+/// The text of `config.json` with the phrase set and every other key kept (S30.7).
+pub fn with_wake_phrase(file: Option<&str>, phrase: &str) -> Result<String, String> {
+    let mut json = match file {
+        Some(text) => serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .filter(serde_json::Value::is_object)
+            .ok_or(INVALID_CONFIG)?,
+        None => serde_json::json!({}),
+    };
+    json["wake_phrase"] = phrase.into();
+    let text = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
+    Ok(text + "\n")
+}
+
+/// The flag `config.json` holds right now, for the app to compare with the one in memory: a save
+/// that failed, or a file edited by hand, leaves the switch saying one thing and the disk another.
+pub fn stored_wake_word(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|json| json["wake_word"].as_bool())
+        .unwrap_or(false)
+}
+
+/// Saves the phrase in `config.json`, privately and in place like every other key.
+pub fn save_wake_phrase(path: &Path, phrase: &str) -> Result<(), String> {
+    let file = match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("Gentle Dot cannot read config.json ({error}), so the phrase was not saved.")),
+    };
+    let text = with_wake_phrase(file.as_deref(), phrase)?;
+    write_private(path, &text).map_err(|error| format!("Gentle Dot cannot save config.json ({error})."))
+}
+
+/// Saves the wake word's flag in `config.json`, the way the shortcut is saved (S33.3): one key
+/// changes, and a private temporary file is renamed over the old one.
+pub fn save_wake_word(path: &Path, wake_word: bool) -> Result<(), String> {
+    let file = match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("Gentle Dot cannot read config.json ({error}), so the wake word was not saved.")),
+    };
+    let text = with_wake_word(file.as_deref(), wake_word)?;
+    write_private(path, &text).map_err(|error| format!("Gentle Dot cannot save config.json ({error})."))
+}
 fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
     let dir = path.parent().unwrap_or(Path::new("."));
@@ -197,8 +323,17 @@ mod tests {
     #[test]
     fn defaults_without_file() {
         let config = parse_config(dir(), None, env_of(&[]));
-        assert_eq!(config, DesktopConfig { data_dir: dir(), port: DEFAULT_PORT, shortcut: DEFAULT_SHORTCUT.into() });
-    }
+        assert_eq!(
+            config,
+            DesktopConfig {
+                data_dir: dir(),
+                port: DEFAULT_PORT,
+                shortcut: DEFAULT_SHORTCUT.into(),
+                voice_input: None,
+                wake_word: false,
+                wake_phrase: DEFAULT_WAKE_PHRASE.into(),
+            }
+        );    }
 
     #[test]
     fn windows_default_shortcut_avoids_the_system_window_menu() {
@@ -261,11 +396,132 @@ mod tests {
         // The file the app writes reads back like any hand-written one: port, shortcut, defaults.
         let text = with_shortcut(Some(r#"{ "port": 5000, "workspace": "~" }"#), "Shift+Super+K").unwrap();
         let config = parse_config(dir(), Some(&text), env_of(&[]));
-        assert_eq!(config, DesktopConfig { data_dir: dir(), port: 5000, shortcut: "Shift+Super+K".into() });
-        let config = parse_config(dir(), Some(&text), env_of(&[("GENTLE_DOT_PORT", "6000")]));
+        assert_eq!(
+            config,
+            DesktopConfig {
+                data_dir: dir(),
+                port: 5000,
+                shortcut: "Shift+Super+K".into(),
+                voice_input: None,
+                wake_word: false,
+                wake_phrase: DEFAULT_WAKE_PHRASE.into(),
+            }
+        );        let config = parse_config(dir(), Some(&text), env_of(&[("GENTLE_DOT_PORT", "6000")]));
         assert_eq!(config.port, 6000);
         let text = with_shortcut(None, "F5").unwrap();
         assert_eq!(parse_config(dir(), Some(&text), env_of(&[])).port, DEFAULT_PORT);
+    }
+
+    #[test]
+    fn the_chosen_microphone_survives_a_read_and_a_write() {
+        let chosen = VoiceInput { uid: "BuiltInMic:1".into(), name: "MacBook Pro Microphone".into() };
+        let text = with_voice_input(Some(r#"{ "port": 5000, "shortcut": "F5" }"#), Some(&chosen)).unwrap();
+        // Every other key is kept.
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["port"], 5000);
+        assert_eq!(json["shortcut"], "F5");
+        assert_eq!(json["voiceInput"], serde_json::json!({ "uid": "BuiltInMic:1", "name": "MacBook Pro Microphone" }));
+        // And it reads back as the same choice.
+        assert_eq!(parse_config(dir(), Some(&text), env_of(&[])).voice_input, Some(chosen));
+        // The same through the file, where the private write is what makes it stick.
+        let dir = scratch("voice-input");
+        let file = dir.join("config.json");
+        std::fs::write(&file, r#"{ "port": 5000 }"#).unwrap();
+        let chosen = VoiceInput { uid: "USB:2".into(), name: "Yeti".into() };
+        save_voice_input(&file, Some(&chosen)).unwrap();
+        let saved = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(parse_config(dir, Some(&saved), env_of(&[])).voice_input, Some(chosen));
+    }
+
+    #[test]
+    fn a_malformed_voice_input_reads_as_no_choice() {
+        let read = |file: &str| parse_config(dir(), Some(file), env_of(&[])).voice_input;
+        assert_eq!(read(r#"{ "port": 5000 }"#), None);
+        assert_eq!(read(r#"{ "voiceInput": null }"#), None);
+        assert_eq!(read(r#"{ "voiceInput": "BuiltInMic:1" }"#), None);
+        assert_eq!(read(r#"{ "voiceInput": { "uid": "BuiltInMic:1" } }"#), None);
+        assert_eq!(read(r#"{ "voiceInput": { "name": "MacBook Pro Microphone" } }"#), None);
+        assert_eq!(read(r#"{ "voiceInput": { "uid": "", "name": "MacBook Pro Microphone" } }"#), None);
+        assert_eq!(read(r#"{ "voiceInput": { "uid": "BuiltInMic:1", "name": "  " } }"#), None);
+        assert_eq!(read(r#"{ "voiceInput": { "uid": 1, "name": 2 } }"#), None);
+        // A complete entry, with the whitespace the panel may leave around it, is a choice.
+        assert_eq!(
+            read(r#"{ "voiceInput": { "uid": " BuiltInMic:1 ", "name": " MacBook Pro Microphone " } }"#),
+            Some(VoiceInput { uid: "BuiltInMic:1".into(), name: "MacBook Pro Microphone".into() })
+        );
+    }
+
+    #[test]
+    fn saving_no_choice_writes_null_and_reads_back_as_the_default() {
+        let text = with_voice_input(Some(r#"{ "port": 5000, "voiceInput": { "uid": "a", "name": "b" } }"#), None).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["voiceInput"], serde_json::Value::Null);
+        assert_eq!(json["port"], 5000);
+        assert_eq!(parse_config(dir(), Some(&text), env_of(&[])).voice_input, None);
+        // The same through the file, where the other keys survive it.
+        let dir = scratch("voice-input-none");
+        let file = dir.join("config.json");
+        let chosen = VoiceInput { uid: "USB:2".into(), name: "Yeti".into() };
+        save_voice_input(&file, Some(&chosen)).unwrap();
+        save_voice_input(&file, None).unwrap();
+        let saved = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(parse_config(dir, Some(&saved), env_of(&[])).voice_input, None);
+        // A file that is not JSON is refused, as for every other key.
+        assert_eq!(with_voice_input(Some("{ not json"), None), Err(INVALID_CONFIG.to_string()));
+    }
+
+    #[test]
+    fn a_typed_phrase_is_one_to_four_words() {
+        assert_eq!(valid_wake_phrase("  oye   Doti "), Ok("oye Doti".to_string()));
+        assert_eq!(valid_wake_phrase("hey dot"), Ok("hey dot".to_string()));
+        assert!(valid_wake_phrase("").is_err(), "nothing to listen for");
+        assert!(valid_wake_phrase("o").is_err(), "one letter is not a word");
+        assert_eq!(valid_wake_phrase("oye"), Ok("oye".to_string()), "one word is enough");
+        assert!(valid_wake_phrase("oye doti ahora mismo ya").is_err(), "five words is a paragraph");
+        assert!(valid_wake_phrase("oye, doti").is_err(), "punctuation is not a word");
+    }
+
+    #[test]
+    fn the_phrase_survives_a_read_and_a_write() {
+        assert_eq!(parse_config(dir(), None, env_of(&[])).wake_phrase, DEFAULT_WAKE_PHRASE);
+        let text = with_wake_phrase(Some(r#"{ "port": 5000, "wake_word": true }"#), "hey dot").unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["wake_phrase"], "hey dot");
+        assert_eq!(json["port"], 5000);
+        assert_eq!(json["wake_word"], true, "the other keys stay");
+        assert_eq!(parse_config(dir(), Some(&text), env_of(&[])).wake_phrase, "hey dot");
+        // An empty one in the file reads as the default, never as silence.
+        assert_eq!(parse_config(dir(), Some(r#"{ "wake_phrase": "  " }"#), env_of(&[])).wake_phrase, DEFAULT_WAKE_PHRASE);
+    }
+
+    #[test]
+    fn the_wake_word_is_off_unless_the_file_says_so() {
+        assert!(!parse_config(dir(), None, env_of(&[])).wake_word);
+        assert!(!parse_config(dir(), Some(r#"{ "port": 5000 }"#), env_of(&[])).wake_word);
+        assert!(!parse_config(dir(), Some(r#"{ "wake_word": "yes" }"#), env_of(&[])).wake_word);
+        assert!(parse_config(dir(), Some(r#"{ "wake_word": true }"#), env_of(&[])).wake_word);
+    }
+
+    #[test]
+    fn saving_the_wake_word_keeps_every_other_key_and_reads_back() {
+        let text = with_wake_word(Some(r#"{ "port": 5000, "shortcut": "F5" }"#), true).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json, serde_json::json!({ "port": 5000, "shortcut": "F5", "wake_word": true }));
+        assert!(parse_config(dir(), Some(&text), env_of(&[])).wake_word);
+        let off = with_wake_word(Some(&text), false).unwrap();
+        assert!(!parse_config(dir(), Some(&off), env_of(&[])).wake_word);
+        assert_eq!(with_wake_word(Some("{ not json"), true), Err(INVALID_CONFIG.to_string()));
+    }
+
+    #[test]
+    fn the_wake_word_is_saved_next_to_the_shortcut() {
+        let dir = scratch("wake");
+        let file = dir.join("config.json");
+        std::fs::write(&file, r#"{ "port": 5000 }"#).unwrap();
+        save_wake_word(&file, true).unwrap();
+        assert!(parse_config(dir.clone(), std::fs::read_to_string(&file).ok().as_deref(), env_of(&[])).wake_word);
+        std::fs::write(&file, "{ not json").unwrap();
+        assert_eq!(save_wake_word(&file, false), Err(INVALID_CONFIG.to_string()));
     }
 
     fn scratch(name: &str) -> PathBuf {

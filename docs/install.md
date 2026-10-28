@@ -71,10 +71,12 @@ On an Apple Silicon Mac with Node 24, pnpm, Rust (`rustc` on `PATH`), and Xcode 
 
 ```sh
 pnpm install
-pnpm package:mac                 # signs ad hoc
+pnpm package:mac                 # picks a signing identity from the keychain
 pnpm package:mac --sign "<identity>"   # or GENTLE_DOT_SIGN_IDENTITY="<identity>"
 pnpm package:mac --check         # also mounts the DMG and smoke-tests the copied app's daemon
 ```
+
+**Every build is signed with the same identity, picked automatically** — `--sign` wins, then `GENTLE_DOT_SIGN_IDENTITY`, then the first `Apple Development:` certificate in the keychain, then "Gentle Dot Local Signing", then any other code signing certificate. Ad hoc is the last resort and says so: an ad hoc signature has **no certificate**, so macOS derives its designated requirement from the build's own hash, which changes on every compile. Screen Recording and Microphone grants are stored against that requirement, so an ad hoc build asks for them again every time, and the entry the user granted stays behind as a dead row in System Settings. A certificate fixes it because its designated requirement names the certificate (`certificate leaf = H"…"`), which does not change when the code does.
 
 To keep permissions across updates, sign every release with the same identity. `scripts/package/create-signing-identity.sh` creates a self-signed one named "Gentle Dot Local Signing" in the login keychain (no trust setting or password needed); its designated requirement pins the certificate (`certificate leaf = H"…"`), so it stays the same across builds. Keep that keychain entry: a new certificate means everyone grants the permissions once more. The first signed build asks once per signed file to use the key; choose **Always Allow** on the first prompt.
 

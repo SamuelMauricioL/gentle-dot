@@ -811,10 +811,15 @@ pub fn run() {
             voice::voice_start,
             voice::voice_stop,
             voice::voice_cancel,
+            voice::voice_input_options,
+            voice::voice_input_set,
             voice::voice_model_status,
             voice::voice_model_download,
             voice::voice_model_cancel,
-            voice::voice_model_remove
+            voice::voice_model_remove,
+            voice::wake_word_status,
+            voice::wake_word_set,
+            voice::wake_phrase_set
         ])
         .setup(move |app| {
             #[cfg(target_os = "macos")]
@@ -904,6 +909,9 @@ pub fn run() {
                 if let Err(reason) = app.state::<Shell>().daemon.stop() {
                     eprintln!("gentle-dot: Windows shutdown was not confirmed: {reason}");
                 }
+                // S4: the microphone listener is removed here, so no CoreAudio notification
+                // outlives the app it was installed for.
+                app.state::<voice::VoiceInput>().stop_watching_devices();
             }
         });
 }

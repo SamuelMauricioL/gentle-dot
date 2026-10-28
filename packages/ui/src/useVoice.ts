@@ -192,14 +192,15 @@ export function useVoice(state: DotState, send: Send): VoiceControls {
 	/** The input holds dictated text that has not been sent yet. */
 	const dictated = useRef(false);
 
+	/** `always` is the wake word's note: nobody is at the keyboard, so its text is sent, not drafted. */
 	const sendTranscript = useCallback(
-		(transcript: string) => {
+		(transcript: string, always = false) => {
 			const text = transcript.trim();
 			if (!text) {
 				finish(REASONS.empty);
 				return;
 			}
-			if (sendOnStopNow.current) {
+			if (always || sendOnStopNow.current) {
 				voiceTurn.current = new Set(latest.current.messages.map((m) => m.id));
 				send({ type: "send", text, requestId: newRequestId() });
 			} else {
@@ -361,14 +362,29 @@ export function useVoice(state: DotState, send: Send): VoiceControls {
 				if (phaseNow.current === "recording") setLevel(value);
 			},
 			error: (message) => {
-				if (recording.current?.kind === "native") finish(message);
+				// A note the wake word started has no button press behind it, so the recording state is
+				// the panel's phase, not a `recording` entry: both end here.
+				if (phaseNow.current === "recording" || recording.current?.kind === "native") finish(message);
+			},
+			// The wake word (S30.7): nobody pressed the button, so the panel mirrors the state the
+			// app already entered and sends the transcript through the same path a stopped note uses.
+			started: () => {
+				if (phaseNow.current === "idle") setPhase("recording");
+			},
+			// A note the phrase started has no hands on the keyboard: it goes to the chat.
+			transcript: (text) => sendTranscript(text, true),
+			// The backend owns the state; the panel only follows it. A recording phase the backend
+			// no longer reports is over, whatever the panel believed.
+			state: (state) => {
+				const phase = state.capture?.phase;
+				if (typeof phase === "string" && phase !== "recording" && phaseNow.current === "recording") finish();
 			},
 		}).catch(() => () => {});
 		return () => {
 			live = false;
 			void off.then((stopListening) => stopListening());
 		};
-	}, [desktop, finish]);
+	}, [desktop, finish, sendTranscript, setPhase]);
 
 	// Installing or removing the local model changes what the recognizer can do (#25).
 	useEffect(() => {

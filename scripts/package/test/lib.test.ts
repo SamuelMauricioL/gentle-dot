@@ -9,6 +9,9 @@ import {
 	engramArchiveName,
 	engramReleaseVersion,
 	hostTarget,
+	LOCAL_IDENTITY,
+	pickSigningIdentity,
+	resolveMacIdentity,
 	nodeArchiveName,
 	nodeVersion,
 	parseArgs,
@@ -121,5 +124,30 @@ describe("tree and manifest", () => {
 				sizeBytes: 0,
 			}),
 		).toThrow(/engram/);
+	});
+});
+
+describe("macOS signing identity", () => {
+	it("prefers a development certificate, then the local one, then any other", () => {
+		expect(pickSigningIdentity(["Apple Development: me (AAA)", LOCAL_IDENTITY]).identity).toBe(
+			"Apple Development: me (AAA)",
+		);
+		expect(pickSigningIdentity([LOCAL_IDENTITY, "Someone Else"]).identity).toBe(LOCAL_IDENTITY);
+		expect(pickSigningIdentity(["Someone Else"]).identity).toBe("Someone Else");
+		expect(pickSigningIdentity([]).identity).toBe("-");
+	});
+
+	it("keeps what was asked for, and only falls back to ad hoc with a warning", () => {
+		expect(resolveMacIdentity("Chosen", [LOCAL_IDENTITY])).toEqual({
+			identity: "Chosen",
+			reason: "asked for",
+			notice: undefined,
+		});
+		const picked = resolveMacIdentity(undefined, ["Apple Development: me (AAA)"]);
+		expect(picked.identity).toBe("Apple Development: me (AAA)");
+		expect(picked.notice).toBeUndefined();
+		const empty = resolveMacIdentity(undefined, []);
+		expect(empty.identity).toBe("-");
+		expect(empty.notice).toContain("designated requirement");
 	});
 });

@@ -48,6 +48,18 @@ export interface NativeVoiceHandlers {
 	partial: (text: string) => void;
 	level: (level: number) => void;
 	error: (message: string) => void;
+	/** The wake word started a note the panel did not ask for (S30.7). */
+	started?: () => void;
+	/** The transcript of a note the wake word ended by itself (S30.7). */
+	transcript?: (text: string) => void;
+	/** The backend's own truth about voice input: the panel mirrors it instead of keeping its own. */
+	state?: (state: VoiceState) => void;
+}
+
+/** What `voice://state` carries: the wake word's switch and what the capture is doing. */
+export interface VoiceState {
+	wake?: { enabled?: unknown; available?: unknown; reason?: unknown; phrase?: unknown };
+	capture?: { phase?: unknown; device?: unknown };
 }
 
 /** Listens to the recognizer's events; resolves with a function that stops listening. */
@@ -66,10 +78,75 @@ export async function onNativeVoice(handlers: NativeVoiceHandlers): Promise<() =
 			const message = event.payload?.message;
 			handlers.error(typeof message === "string" && message ? message : "Listening stopped.");
 		}),
+		listen<Record<string, never>>("voice://started", () => handlers.started?.()),
+		listen<{ text?: unknown }>("voice://transcript", (event) => {
+			if (typeof event.payload?.text === "string") handlers.transcript?.(event.payload.text);
+		}),
+		listen<VoiceState>("voice://state", (event) => handlers.state?.(event.payload ?? {})),
 	]);
 	return () => {
 		for (const stop of stops) stop();
 	};
+}
+
+/**
+ * The event the app pushes the whole list on whenever the Mac's devices change (S1, S2): the
+ * panel's microphone picker follows it instead of the snapshot it read when it opened.
+ */
+export const VOICE_DEVICES_EVENT = "voice://devices";
+
+/**
+ * The input devices the app offers and the one chosen (S1, S4): the stored identity is the device
+ * UID and the name is display only. `chosen` is `null` when following the system default.
+ */
+export interface VoiceInputDevice {
+	uid: string;
+	name: string;
+}
+
+export interface VoiceInputOptions {
+	devices: VoiceInputDevice[];
+	chosen: string | null;
+	default: string | null;
+}
+
+/** The devices and the stored choice; a malformed answer reads as no devices yet and the system default. */
+export async function loadVoiceInputOptions(): Promise<VoiceInputOptions> {
+	return optionsOf(await invoke<Payload | undefined>("voice_input_options"));
+}
+
+type Payload = { devices?: unknown; chosen?: unknown; default?: unknown };
+
+/** The reply, or the payload the app pushes, read one way: the two are the same shape (S1). */
+function optionsOf(answer: Payload | undefined | null): VoiceInputOptions {
+	const list: unknown[] = Array.isArray(answer?.devices) ? answer.devices : [];
+	const devices: VoiceInputDevice[] = [];
+	for (const entry of list) {
+		const device = entry as { uid?: unknown; name?: unknown } | null | undefined;
+		if (typeof device?.uid !== "string" || !device.uid) continue;
+		devices.push({ uid: device.uid, name: typeof device.name === "string" ? device.name : "" });
+	}
+	return { devices, chosen: deviceId(answer?.chosen), default: deviceId(answer?.default) };
+}
+
+/**
+ * The whole list the app pushes whenever the Mac's devices change (S1, S2): a headset connected,
+ * paired or unplugged re-renders the picker without anything being restarted.
+ */
+export async function onVoiceDevices(handler: (options: VoiceInputOptions) => void): Promise<() => void> {
+	const { listen } = await tauriEvents();
+	return listen<Payload>(VOICE_DEVICES_EVENT, (event) => handler(optionsOf(event.payload)));
+}
+
+/** A device UID the app gave, or `null` (the system default) when it gave none. */
+function deviceId(value: unknown): string | null {
+	return typeof value === "string" && value ? value : null;
+}
+
+/** Stores the chosen microphone by UID (`null` follows the system default); rejects with the app's reason. */
+export async function saveVoiceInput(uid: string | null): Promise<string | null> {
+	const result = await invoke<{ chosen?: string | null } | undefined>("voice_input_set", { uid });
+	return result?.chosen ?? null;
 }
 
 /** Why `voice_start` refused, in the app's words when it gave some. */
